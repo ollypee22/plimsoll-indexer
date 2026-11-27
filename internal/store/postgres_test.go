@@ -57,6 +57,7 @@ func runWithPostgres(m *testing.M) int {
 	}
 	var serverLog bytes.Buffer
 	pg := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
+		Version(embeddedpostgres.V16).
 		Port(port).
 		RuntimePath(filepath.Join(dir, "runtime")).
 		DataPath(filepath.Join(dir, "data")).

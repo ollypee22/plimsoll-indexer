@@ -331,6 +331,8 @@ func backoffDelay(attempt int, retryAfter time.Duration) time.Duration {
 	}
 	d = min(d, maxBackoff)
 	half := d / 2
+	// #nosec G404 -- this jitter only spreads retries; it makes no security
+	// decision, so a cryptographic source would be wasted entropy.
 	return half + time.Duration(rand.Int64N(int64(half)+1))
 }
 
