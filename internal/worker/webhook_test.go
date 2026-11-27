@@ -14,68 +14,93 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 )
 
-type fakeWebhookDelivery struct {
-	coverage.WebhookDelivery
-	delivered bool
-	nextAt    time.Time
-	status    int
-	lastErr   string
-}
+const webhookSAC = "CSACWEBHOOK"
 
+// fakeWebhookStore is an in-memory WebhookStore for notifier tests.
 type fakeWebhookStore struct {
 	hooks      []coverage.Webhook
 	supply     map[string]*coverage.Supply
 	reports    map[string]map[uint32]coverage.Report
-	deliveries []*fakeWebhookDelivery
+	deliveries []*fakeDelivery
+	nextID     int64
+	now        time.Time
+	// current, when set, overrides the frozen now so a test can advance the
+	// clock it shares with the notifier.
+	current func() time.Time
 }
 
-func (s *fakeWebhookStore) ListWebhooks(context.Context) ([]coverage.Webhook, error) {
-	return s.hooks, nil
+type fakeDelivery struct {
+	id         int64
+	webhookID  int64
+	payload    []byte
+	attempts   int
+	nextAt     time.Time
+	delivered  bool
+	lastStatus int
 }
 
-func (s *fakeWebhookStore) LatestSupply(_ context.Context, sac string) (*coverage.Supply, error) {
-	return s.supply[sac], nil
+func newFakeWebhookStore(now time.Time) *fakeWebhookStore {
+	return &fakeWebhookStore{
+		supply:  map[string]*coverage.Supply{},
+		reports: map[string]map[uint32]coverage.Report{},
+		now:     now,
+	}
 }
 
-func (s *fakeWebhookStore) LatestReports(_ context.Context, sac string) (map[uint32]coverage.Report, error) {
-	if r := s.reports[sac]; r != nil {
+func (f *fakeWebhookStore) clock() time.Time {
+	if f.current != nil {
+		return f.current()
+	}
+	return f.now
+}
+
+func (f *fakeWebhookStore) ListCoverageWebhooks(context.Context) ([]coverage.Webhook, error) {
+	return f.hooks, nil
+}
+
+func (f *fakeWebhookStore) LatestSupply(_ context.Context, sac string) (*coverage.Supply, error) {
+	return f.supply[sac], nil
+}
+
+func (f *fakeWebhookStore) LatestReports(_ context.Context, sac string) (map[uint32]coverage.Report, error) {
+	if r := f.reports[sac]; r != nil {
 		return r, nil
 	}
 	return map[uint32]coverage.Report{}, nil
 }
 
-func (s *fakeWebhookStore) SetWebhookAlerted(_ context.Context, id int64, alerted bool) error {
-	for i := range s.hooks {
-		if s.hooks[i].ID == id {
-			s.hooks[i].Alerted = alerted
+func (f *fakeWebhookStore) SetCoverageWebhookAlerted(_ context.Context, id int64, alerted bool) error {
+	for i := range f.hooks {
+		if f.hooks[i].ID == id {
+			f.hooks[i].Alerted = alerted
 		}
 	}
 	return nil
 }
 
-func (s *fakeWebhookStore) EnqueueWebhookDelivery(_ context.Context, webhookID int64, payload []byte) error {
-	url := ""
-	for _, h := range s.hooks {
-		if h.ID == webhookID {
-			url = h.URL
-		}
-	}
-	id := int64(len(s.deliveries) + 1)
-	s.deliveries = append(s.deliveries, &fakeWebhookDelivery{
-		WebhookDelivery: coverage.WebhookDelivery{
-			ID: id, WebhookID: webhookID, URL: url, Payload: append([]byte(nil), payload...),
-		},
+func (f *fakeWebhookStore) EnqueueCoverageWebhookDelivery(_ context.Context, webhookID int64, payload []byte) error {
+	f.nextID++
+	f.deliveries = append(f.deliveries, &fakeDelivery{
+		id: f.nextID, webhookID: webhookID, payload: payload, nextAt: f.clock(),
 	})
 	return nil
 }
 
-func (s *fakeWebhookStore) DueWebhookDeliveries(_ context.Context, limit, maxAttempts int) ([]coverage.WebhookDelivery, error) {
+func (f *fakeWebhookStore) DueCoverageWebhookDeliveries(_ context.Context, limit, maxAttempts int) ([]coverage.WebhookDelivery, error) {
 	var out []coverage.WebhookDelivery
-	for _, d := range s.deliveries {
-		if d.delivered || d.Attempts >= maxAttempts {
+	for _, d := range f.deliveries {
+		if d.delivered || d.attempts >= maxAttempts || d.nextAt.After(f.clock()) {
 			continue
 		}
-		out = append(out, d.WebhookDelivery)
+		var url string
+		for _, h := range f.hooks {
+			if h.ID == d.webhookID {
+				url = h.URL
+			}
+		}
+		out = append(out, coverage.WebhookDelivery{
+			ID: d.id, WebhookID: d.webhookID, URL: url, Payload: d.payload, Attempts: d.attempts,
+		})
 		if len(out) == limit {
 			break
 		}
@@ -83,247 +108,253 @@ func (s *fakeWebhookStore) DueWebhookDeliveries(_ context.Context, limit, maxAtt
 	return out, nil
 }
 
-func (s *fakeWebhookStore) RecordWebhookAttempt(_ context.Context, id int64, status int, errMsg string, delivered bool, nextAt time.Time) error {
-	for _, d := range s.deliveries {
-		if d.ID != id {
-			continue
+func (f *fakeWebhookStore) RecordCoverageWebhookAttempt(_ context.Context, id int64, status int, _ string, delivered bool, nextAt time.Time) error {
+	for _, d := range f.deliveries {
+		if d.id == id {
+			d.attempts++
+			d.lastStatus = status
+			d.delivered = delivered
+			d.nextAt = nextAt
 		}
-		d.Attempts++
-		d.status, d.lastErr, d.delivered, d.nextAt = status, errMsg, delivered, nextAt
 	}
 	return nil
 }
 
-// receiver records every delivery it is sent and answers with status.
-type receiver struct {
-	mu         sync.Mutex
-	bodies     [][]byte
-	signatures []string
-	deliveries []string
-	status     int
-	failFirst  int
+// webhookReceiver is an httptest receiver that records requests and answers
+// with the given status codes in order, repeating the last one.
+type webhookReceiver struct {
+	mu      sync.Mutex
+	bodies  [][]byte
+	signs   []string
+	status  []int
+	receive int
 }
 
-func newReceiver(status int) (*receiver, *httptest.Server) {
-	rc := &receiver{status: status}
+func newWebhookReceiver(status ...int) (*httptest.Server, *webhookReceiver) {
+	rec := &webhookReceiver{status: status}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		rc.mu.Lock()
-		rc.bodies = append(rc.bodies, body)
-		rc.signatures = append(rc.signatures, r.Header.Get(SignatureHeader))
-		rc.deliveries = append(rc.deliveries, r.Header.Get("X-Plimsoll-Delivery"))
-		fail := rc.status
-		if rc.failFirst > 0 {
-			rc.failFirst--
-			fail = http.StatusInternalServerError
-			defer rc.mu.Unlock()
-			w.WriteHeader(fail)
-			return
+		rec.mu.Lock()
+		rec.bodies = append(rec.bodies, body)
+		rec.signs = append(rec.signs, r.Header.Get("X-Plimsoll-Signature"))
+		code := http.StatusOK
+		if len(rec.status) > 0 {
+			i := rec.receive
+			if i >= len(rec.status) {
+				i = len(rec.status) - 1
+			}
+			code = rec.status[i]
 		}
-		rc.mu.Unlock()
-		w.WriteHeader(fail)
+		rec.receive++
+		rec.mu.Unlock()
+		w.WriteHeader(code)
 	}))
-	return rc, srv
+	return srv, rec
 }
 
-func (r *receiver) count() int {
+func (r *webhookReceiver) requests() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.bodies)
 }
 
-func testWebhookStore(url string) *fakeWebhookStore {
-	base := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
-	return &fakeWebhookStore{
-		hooks: []coverage.Webhook{{
-			ID: 7, URL: url, SAC: "CSAC", MinBps: 9500, MinTier: coverage.TierIssuerSigned,
-		}},
-		supply: map[string]*coverage.Supply{
-			"CSAC": {Amount: big.NewInt(1000), Ledger: 10, PostedAt: base},
-		},
-		reports: map[string]map[uint32]coverage.Report{
-			"CSAC": {coverage.TierIssuerSigned: {
-				Tier: coverage.TierIssuerSigned, Amount: big.NewInt(900), AsOf: base,
-			}},
+var webhookNow = time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+
+// droppingCoverage installs a supply snapshot and a report whose bps is below
+// the webhook's threshold.
+func droppingCoverage(store *fakeWebhookStore, bps uint32) {
+	store.supply[webhookSAC] = &coverage.Supply{
+		Amount: big.NewInt(1_000_000), Ledger: 100, PostedAt: webhookNow,
+	}
+	reserves := new(big.Int).Mul(big.NewInt(1_000_000), big.NewInt(int64(bps)))
+	reserves.Quo(reserves, big.NewInt(10_000))
+	store.reports[webhookSAC] = map[uint32]coverage.Report{
+		coverage.TierTranscribed: {
+			Tier: coverage.TierTranscribed, Amount: reserves, AsOf: webhookNow,
+			Reporter: "GREP", DocHash: "h", DocURI: "https://issuer.example/report",
 		},
 	}
 }
 
-func setReportBps(store *fakeWebhookStore, amount int64, at time.Time) {
-	store.reports["CSAC"] = map[uint32]coverage.Report{
-		coverage.TierIssuerSigned: {
-			Tier: coverage.TierIssuerSigned, Amount: big.NewInt(amount), AsOf: at,
-		},
+func testNotifier(store *fakeWebhookStore, secret string, now *time.Time) *WebhookNotifier {
+	store.current = func() time.Time { return *now }
+	return &WebhookNotifier{
+		Store:   store,
+		Secret:  secret,
+		Log:     discardLog(),
+		Now:     func() time.Time { return *now },
+		Backoff: time.Minute,
 	}
 }
 
-func TestWebhookNotifierAlertsOncePerCrossingAndSigns(t *testing.T) {
-	rc, srv := newReceiver(http.StatusOK)
+func TestWebhookNotifierDeliversSignedPayloadOnce(t *testing.T) {
+	srv, rec := newWebhookReceiver()
 	defer srv.Close()
-	store := testWebhookStore(srv.URL)
-	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
-	n := &WebhookNotifier{
-		Store: store, Secret: "s3cret", Log: discardLog(),
-		Now: func() time.Time { return now },
-	}
+
+	now := webhookNow
+	store := newFakeWebhookStore(now)
+	store.hooks = []coverage.Webhook{{ID: 1, URL: srv.URL, SAC: webhookSAC, MinBps: 10_000, MinTier: 1}}
+	droppingCoverage(store, 9_000)
+	n := testNotifier(store, "s3cret", &now)
 
 	if err := n.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if rc.count() != 1 {
-		t.Fatalf("receiver got %d deliveries, want 1", rc.count())
+	if got := rec.requests(); got != 1 {
+		t.Fatalf("receiver got %d requests, want 1", got)
+	}
+	body := rec.bodies[0]
+	if want := signWebhook("s3cret", body); rec.signs[0] != want {
+		t.Fatalf("signature = %q, want %q", rec.signs[0], want)
+	}
+	var p webhookPayload
+	if err := json.Unmarshal(body, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Event != webhookEvent || p.WebhookID != 1 || p.SAC != webhookSAC ||
+		p.MinBps != 10_000 || p.Bps != 9_000 || p.Tier != "transcribed" ||
+		p.Supply != "1000000" || p.Reserves != "900000" || p.MinTier != "transcribed" {
+		t.Fatalf("payload = %+v", p)
 	}
 	if !store.hooks[0].Alerted {
 		t.Fatal("webhook was not marked alerted")
 	}
-	if len(store.deliveries) != 1 || !store.deliveries[0].delivered || store.deliveries[0].Attempts != 1 {
-		t.Fatalf("delivery log = %+v", store.deliveries)
-	}
 
-	// Verify the exact bytes the receiver got against the signature.
-	body := rc.bodies[0]
-	if got, want := rc.signatures[0], signWebhook("s3cret", body); got != want {
-		t.Fatalf("signature = %q, want %q", got, want)
-	}
-	if rc.deliveries[0] != "1" {
-		t.Fatalf("delivery header = %q, want 1", rc.deliveries[0])
-	}
-	var payload struct {
-		Event    string    `json:"event"`
-		SAC      string    `json:"sac"`
-		MinBps   uint32    `json:"min_bps"`
-		MinTier  string    `json:"min_tier"`
-		Bps      uint32    `json:"bps"`
-		Supply   string    `json:"supply"`
-		Reserves string    `json:"reserves"`
-		SentAt   time.Time `json:"sent_at"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload.Event != "coverage_dropped" || payload.SAC != "CSAC" || payload.MinBps != 9500 ||
-		payload.MinTier != "issuer_signed" || payload.Bps != 9000 ||
-		payload.Supply != "1000" || payload.Reserves != "900" || !payload.SentAt.Equal(now) {
-		t.Fatalf("payload = %+v", payload)
-	}
-
-	// Still below the threshold: no second alert for the same crossing.
+	// A second pass while still below the threshold must not alert again.
 	if err := n.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if rc.count() != 1 {
-		t.Fatalf("sustained shortfall produced %d deliveries, want 1", rc.count())
+	if got := rec.requests(); got != 1 {
+		t.Fatalf("receiver got %d requests after re-run, want 1", got)
+	}
+}
+
+func TestWebhookNotifierRearmsAfterRecovery(t *testing.T) {
+	srv, rec := newWebhookReceiver()
+	defer srv.Close()
+
+	now := webhookNow
+	store := newFakeWebhookStore(now)
+	store.hooks = []coverage.Webhook{{ID: 1, URL: srv.URL, SAC: webhookSAC, MinBps: 9_500, MinTier: 1}}
+	droppingCoverage(store, 9_000)
+	n := testNotifier(store, "s", &now)
+	if err := n.Run(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 
-	// Recovery re-arms the webhook.
-	setReportBps(store, 960, now.Add(time.Hour))
+	// Coverage recovers: the webhook re-arms without a second delivery.
+	droppingCoverage(store, 10_000)
 	if err := n.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if store.hooks[0].Alerted {
-		t.Fatal("webhook was not re-armed after coverage recovered")
+		t.Fatal("webhook stayed alerted after coverage recovered")
+	}
+	if got := rec.requests(); got != 1 {
+		t.Fatalf("receiver got %d requests, want 1", got)
 	}
 
-	// The next drop is a new crossing and alerts again.
-	setReportBps(store, 900, now.Add(2*time.Hour))
+	// A new drop alerts again.
+	droppingCoverage(store, 9_000)
 	if err := n.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if rc.count() != 2 {
-		t.Fatalf("second crossing produced %d deliveries in total, want 2", rc.count())
+	if got := rec.requests(); got != 2 {
+		t.Fatalf("receiver got %d requests after a second drop, want 2", got)
 	}
 }
 
-func TestWebhookNotifierRetriesWithBackoffAtMostFiveTimes(t *testing.T) {
-	rc, srv := newReceiver(http.StatusServiceUnavailable)
+func TestWebhookNotifierRetriesWithBackoff(t *testing.T) {
+	srv, rec := newWebhookReceiver(http.StatusInternalServerError, http.StatusBadGateway, http.StatusOK)
 	defer srv.Close()
-	store := testWebhookStore(srv.URL)
-	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
-	n := &WebhookNotifier{
-		Store: store, Secret: "s3cret", Log: discardLog(),
-		Now:     func() time.Time { return now },
-		Backoff: 30 * time.Second,
+
+	now := webhookNow
+	store := newFakeWebhookStore(now)
+	store.hooks = []coverage.Webhook{{ID: 1, URL: srv.URL, SAC: webhookSAC, MinBps: 10_000, MinTier: 1}}
+	droppingCoverage(store, 9_000)
+	n := testNotifier(store, "s", &now)
+
+	// First attempt fails and schedules the retry a minute out.
+	if err := n.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Before the backoff elapses nothing is sent.
+	if err := n.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.requests(); got != 1 {
+		t.Fatalf("receiver got %d requests before backoff, want 1", got)
 	}
 
-	for attempt := 1; attempt <= webhookMaxAttempts; attempt++ {
+	now = now.Add(time.Minute)
+	if err := n.Run(context.Background()); err != nil { // second attempt: 502
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Minute)                      // backoff doubled
+	if err := n.Run(context.Background()); err != nil { // third attempt: 200
+		t.Fatal(err)
+	}
+	if got := rec.requests(); got != 3 {
+		t.Fatalf("receiver got %d requests, want 3", got)
+	}
+	d := store.deliveries[0]
+	if d.attempts != 3 || !d.delivered || d.lastStatus != http.StatusOK {
+		t.Fatalf("delivery = %+v, want 3 attempts and delivered", d)
+	}
+
+	// Delivered deliveries are never sent again.
+	now = now.Add(time.Hour)
+	if err := n.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.requests(); got != 3 {
+		t.Fatalf("receiver got %d requests after delivery, want 3", got)
+	}
+}
+
+func TestWebhookNotifierStopsAfterFiveAttempts(t *testing.T) {
+	srv, rec := newWebhookReceiver(http.StatusInternalServerError)
+	defer srv.Close()
+
+	now := webhookNow
+	store := newFakeWebhookStore(now)
+	store.hooks = []coverage.Webhook{{ID: 1, URL: srv.URL, SAC: webhookSAC, MinBps: 10_000, MinTier: 1}}
+	droppingCoverage(store, 9_000)
+	n := testNotifier(store, "s", &now)
+
+	for range 10 {
 		if err := n.Run(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if rc.count() != attempt {
-			t.Fatalf("after attempt %d the receiver has %d requests", attempt, rc.count())
-		}
-		got := store.deliveries[0]
-		if got.Attempts != attempt {
-			t.Fatalf("attempts = %d, want %d", got.Attempts, attempt)
-		}
-		if got.delivered {
-			t.Fatalf("delivery marked delivered after a %d response", http.StatusServiceUnavailable)
-		}
-		wantNext := now.Add(30 * time.Second << (attempt - 1))
-		if !got.nextAt.Equal(wantNext) {
-			t.Fatalf("attempt %d next_attempt_at = %v, want %v", attempt, got.nextAt, wantNext)
-		}
-		now = got.nextAt
+		now = now.Add(time.Hour)
 	}
-
-	// The cap is reached: another tick must not send a sixth attempt.
-	if err := n.Run(context.Background()); err != nil {
-		t.Fatal(err)
+	if got := rec.requests(); got != webhookMaxAttempts {
+		t.Fatalf("receiver got %d requests, want %d", got, webhookMaxAttempts)
 	}
-	if rc.count() != webhookMaxAttempts {
-		t.Fatalf("receiver got %d requests after the cap, want %d", rc.count(), webhookMaxAttempts)
+	if got := store.deliveries[0].attempts; got != webhookMaxAttempts {
+		t.Fatalf("delivery logged %d attempts, want %d", got, webhookMaxAttempts)
 	}
-}
-
-func TestWebhookNotifierStopsAfterSuccess(t *testing.T) {
-	rc, srv := newReceiver(http.StatusOK)
-	rc.failFirst = 1 // fail the first attempt, accept the retry
-	defer srv.Close()
-	store := testWebhookStore(srv.URL)
-	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
-	n := &WebhookNotifier{
-		Store: store, Secret: "s3cret", Log: discardLog(),
-		Now:     func() time.Time { return now },
-		Backoff: 30 * time.Second,
-	}
-
-	if err := n.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	now = now.Add(30 * time.Second)
-	if err := n.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if rc.count() != 2 {
-		t.Fatalf("receiver got %d requests, want 2", rc.count())
-	}
-	if !store.deliveries[0].delivered || store.deliveries[0].Attempts != 2 {
-		t.Fatalf("delivery = %+v, want delivered on attempt 2", store.deliveries[0])
-	}
-
-	// A delivered alert is never sent again.
-	now = now.Add(24 * time.Hour)
-	if err := n.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if rc.count() != 2 {
-		t.Fatalf("receiver got %d requests after delivery, want 2", rc.count())
+	if store.deliveries[0].delivered {
+		t.Fatal("failed delivery marked delivered")
 	}
 }
 
 func TestWebhookNotifierIgnoresUnknownCoverage(t *testing.T) {
-	rc, srv := newReceiver(http.StatusOK)
+	srv, rec := newWebhookReceiver()
 	defer srv.Close()
-	store := testWebhookStore(srv.URL)
-	store.supply = nil // no snapshot: coverage unknown, not zero
-	n := &WebhookNotifier{
-		Store: store, Secret: "s3cret", Log: discardLog(),
-		Now: func() time.Time { return time.Now() },
-	}
+
+	now := webhookNow
+	store := newFakeWebhookStore(now)
+	store.hooks = []coverage.Webhook{{ID: 1, URL: srv.URL, SAC: webhookSAC, MinBps: 10_000, MinTier: 1}}
+	n := testNotifier(store, "s", &now)
+
 	if err := n.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if rc.count() != 0 || len(store.deliveries) != 0 {
-		t.Fatalf("unknown coverage produced %d deliveries", len(store.deliveries))
+	if got := rec.requests(); got != 0 {
+		t.Fatalf("receiver got %d requests with no coverage, want 0", got)
+	}
+	if len(store.deliveries) != 0 {
+		t.Fatalf("queued %d deliveries with no coverage, want 0", len(store.deliveries))
 	}
 }

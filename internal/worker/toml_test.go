@@ -2,7 +2,12 @@ package worker
 
 import (
 	"context"
-	"errors"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -10,80 +15,97 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/stellartoml"
 )
 
-type fakeTomlStore struct {
-	recorded []recordedAttestation
+type tomlTestHorizon struct{}
+
+func (tomlTestHorizon) HomeDomain(context.Context, string) (string, error) {
+	return "issuer.example", nil
 }
 
-type recordedAttestation struct {
-	sac, url, hash string
-	at             time.Time
+type tomlTestStore struct {
+	assets       []coverage.Asset
+	hashes       map[string]string
+	changed      int
+	attestations []string
 }
 
-func (s *fakeTomlStore) ListAssets(context.Context) ([]coverage.Asset, error) { return nil, nil }
-func (s *fakeTomlStore) SaveToml(context.Context, string, []byte, string, time.Time) error {
+func (s *tomlTestStore) ListAssets(context.Context) ([]coverage.Asset, error) {
+	return s.assets, nil
+}
+
+func (s *tomlTestStore) SaveToml(context.Context, string, []byte, string, time.Time) error {
 	return nil
 }
-func (s *fakeTomlStore) RecordAttestation(_ context.Context, sac, url, hash string, at time.Time) error {
-	s.recorded = append(s.recorded, recordedAttestation{sac: sac, url: url, hash: hash, at: at})
+
+func (s *tomlTestStore) RecordAttestation(_ context.Context, sac, url, hash string, _ time.Time) error {
+	s.attestations = append(s.attestations, sac+" "+url+" "+hash)
 	return nil
 }
 
-type fakeAttestationFetcher struct {
-	hash string
-	err  error
-	uri  string
+func (s *tomlTestStore) SaveIssuerTomlSnapshot(_ context.Context, issuer, _, hash string, _ time.Time) (string, bool, error) {
+	old := s.hashes[issuer]
+	if old == hash {
+		return old, false, nil
+	}
+	s.hashes[issuer] = hash
+	s.changed++
+	return old, old != "", nil
 }
 
-func (f *fakeAttestationFetcher) Fetch(_ context.Context, uri string) (string, error) {
-	f.uri = uri
-	return f.hash, f.err
+type tomlTestNotifier struct {
+	changes [][4]string
 }
 
-func TestCheckAttestationRecordsHash(t *testing.T) {
-	store := &fakeTomlStore{}
-	fetcher := &fakeAttestationFetcher{hash: "abc123"}
-	at := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
-	sync := &TomlSync{Store: store, Attestation: fetcher, Log: discardLog()}
-	info := stellartoml.Info{Currency: &stellartoml.Currency{
-		Code: "PUSD", AttestationOfReserve: "https://issuer.example/audit.pdf",
-	}}
-	asset := coverage.Asset{SAC: "CSAC", Code: "PUSD", Issuer: "GISS"}
-
-	sync.checkAttestation(context.Background(), asset, info, at)
-
-	if fetcher.uri != "https://issuer.example/audit.pdf" {
-		t.Fatalf("fetched %q, want the stellar.toml URL", fetcher.uri)
-	}
-	if len(store.recorded) != 1 {
-		t.Fatalf("recorded %d attestations, want 1", len(store.recorded))
-	}
-	got := store.recorded[0]
-	if got.sac != "CSAC" || got.url != "https://issuer.example/audit.pdf" || got.hash != "abc123" || !got.at.Equal(at) {
-		t.Fatalf("recorded %+v", got)
-	}
+func (n *tomlTestNotifier) TOMLChanged(_ context.Context, issuer, domain, oldHash, newHash string) error {
+	n.changes = append(n.changes, [4]string{issuer, domain, oldHash, newHash})
+	return nil
 }
 
-func TestCheckAttestationSkipsMissingOrUnreachable(t *testing.T) {
-	at := time.Now()
-	for name, tc := range map[string]struct {
-		info    stellartoml.Info
-		fetcher *fakeAttestationFetcher
-	}{
-		"no currency":     {info: stellartoml.Info{}},
-		"no attestation":  {info: stellartoml.Info{Currency: &stellartoml.Currency{Code: "PUSD"}}},
-		"fetch fails":     {info: stellartoml.Info{Currency: &stellartoml.Currency{AttestationOfReserve: "https://x"}}, fetcher: &fakeAttestationFetcher{err: errors.New("boom")}},
-		"fetcher not set": {info: stellartoml.Info{Currency: &stellartoml.Currency{AttestationOfReserve: "https://x"}}},
-	} {
-		t.Run(name, func(t *testing.T) {
-			store := &fakeTomlStore{}
-			sync := &TomlSync{Store: store, Log: discardLog()}
-			if tc.fetcher != nil {
-				sync.Attestation = tc.fetcher
-			}
-			sync.checkAttestation(context.Background(), coverage.Asset{SAC: "CSAC"}, tc.info, at)
-			if len(store.recorded) != 0 {
-				t.Fatalf("recorded %+v, want nothing", store.recorded)
-			}
-		})
+func TestTomlSyncDetectsAndDeliversContentChange(t *testing.T) {
+	document := []byte("[DOCUMENTATION]\nORG_NAME = \"First\"\n")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(document)
+	}))
+	defer server.Close()
+	fetcher := stellartoml.NewFetcher()
+	fetcher.HTTP = server.Client()
+	fetcher.URLFor = func(string) string { return server.URL }
+
+	db := &tomlTestStore{
+		assets: []coverage.Asset{{SAC: "CSAC", Code: "PUSD", Issuer: "GISSUER"}},
+		hashes: make(map[string]string),
+	}
+	notifier := &tomlTestNotifier{}
+	syncer := &TomlSync{
+		Horizon:  tomlTestHorizon{},
+		Fetcher:  fetcher,
+		Store:    db,
+		Webhooks: notifier,
+		MaxAge:   -time.Second,
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	if err := syncer.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.changes) != 0 {
+		t.Fatalf("initial document unexpectedly generated a change: %+v", notifier.changes)
+	}
+	oldSum := sha256.Sum256(document)
+
+	document = []byte("[DOCUMENTATION]\nORG_NAME = \"Changed\"\n")
+	if err := syncer.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	newSum := sha256.Sum256(document)
+	if len(notifier.changes) != 1 {
+		t.Fatalf("got %d change notifications, want 1", len(notifier.changes))
+	}
+	change := notifier.changes[0]
+	if change[0] != "GISSUER" || change[1] != "issuer.example" ||
+		change[2] != hex.EncodeToString(oldSum[:]) || change[3] != hex.EncodeToString(newSum[:]) {
+		t.Fatalf("notification = %q, want issuer/domain/old/new hashes", change)
+	}
+	if db.changed != 2 {
+		t.Fatalf("stored %d changed snapshots, want initial and changed snapshots", db.changed)
 	}
 }

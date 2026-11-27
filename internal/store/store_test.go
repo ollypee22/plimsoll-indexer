@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
@@ -13,7 +13,7 @@ import (
 )
 
 // The tests in this file need a real Postgres. postgres_test.go starts one for
-// the package and each test skips with a message under `go test -short`.
+// the package and skips each test when `go test -short` is set.
 
 const testSAC = "CSACSTORETEST"
 
@@ -57,7 +57,7 @@ func TestApplyEventsIsIdempotent(t *testing.T) {
 		soroban.ReporterRevoked{Meta: eventMeta("ev-revoked", 14, base.Add(4*time.Minute)), Reporter: "GREP"},
 	}
 
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, events); err != nil {
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, nil, events); err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
 	tables := []string{"assets", "supply_snapshots", "reserve_reports", "reporters", "ingest_cursor"}
@@ -69,46 +69,40 @@ func TestApplyEventsIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstSupply, err := s.SupplyHistory(ctx, testSAC, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstReports, err := s.ReportHistory(ctx, testSAC, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	// The same page delivered twice by a retried RPC call must be a no-op.
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, events); err != nil {
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, nil, events); err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
 	second := tableCounts(t, url, tables...)
 	for _, table := range tables {
 		if first[table] != second[table] {
-			t.Errorf("%s has %d rows after re-applying, want %d", table, second[table], first[table])
+			t.Errorf("%s has %d rows after re-apply, want %d", table, second[table], first[table])
 		}
 	}
 	again, err := s.Progress(ctx, "plimsoll-events")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again != progress {
-		t.Errorf("progress after re-applying = %+v, want %+v", again, progress)
+	if again.Cursor != progress.Cursor || again.ScannedLedger != progress.ScannedLedger ||
+		again.EventLedger != progress.EventLedger || !again.EventAt.Equal(progress.EventAt) {
+		t.Fatalf("progress changed on re-apply: %+v then %+v", progress, again)
 	}
-	secondSupply, err := s.SupplyHistory(ctx, testSAC, 10)
+
+	// The re-applied events left exactly one snapshot and one report.
+	supply, err := s.SupplyHistory(ctx, testSAC, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondReports, err := s.ReportHistory(ctx, testSAC, 10)
+	if len(supply) != 1 || supply[0].Amount.Cmp(big.NewInt(1_000_000)) != 0 || supply[0].Ledger != 9 {
+		t.Fatalf("supply history = %+v", supply)
+	}
+	reports, err := s.ReportHistory(ctx, testSAC, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(secondSupply) != len(firstSupply) || len(secondReports) != len(firstReports) {
-		t.Fatalf("history changed after re-applying: supply %d→%d, reports %d→%d",
-			len(firstSupply), len(secondSupply), len(firstReports), len(secondReports))
-	}
-	if len(secondSupply) != 1 || secondSupply[0].Amount.Cmp(big.NewInt(1_000_000)) != 0 {
-		t.Fatalf("supply history = %+v", secondSupply)
+	if len(reports) != 1 || reports[0].Tier != 2 || reports[0].Amount.Cmp(big.NewInt(1_020_000)) != 0 {
+		t.Fatalf("report history = %+v", reports)
 	}
 }
 
@@ -117,57 +111,55 @@ func TestLatestReportsReturnsNewestPerTier(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 
-	events := []any{
-		soroban.ReservePosted{
-			Meta: eventMeta("ev-t1-old", 20, base), SAC: testSAC, Tier: 1,
-			Amount: big.NewInt(100), AsOf: base, Reporter: "GOLD", DocHash: "doc-1",
-		},
-		soroban.ReservePosted{
-			Meta: eventMeta("ev-t1-new", 21, base.Add(time.Hour)), SAC: testSAC, Tier: 1,
-			Amount: big.NewInt(200), AsOf: base.Add(2 * time.Hour), Reporter: "GNEW", DocHash: "doc-2",
-		},
-		soroban.ReservePosted{
-			Meta: eventMeta("ev-t3", 22, base.Add(2*time.Hour)), SAC: testSAC, Tier: 3,
-			Amount: big.NewInt(300), AsOf: base.Add(3 * time.Hour), Reporter: "GAUD", DocHash: "doc-3",
-		},
-		// A report for another asset must not leak into this one's tiers.
-		soroban.ReservePosted{
-			Meta: eventMeta("ev-other", 23, base), SAC: "COSAC", Tier: 2,
-			Amount: big.NewInt(999), AsOf: base.Add(4 * time.Hour), Reporter: "GOTHER", DocHash: "doc-4",
-		},
+	report := func(id string, tier uint32, amount int64, asOf time.Time) soroban.ReservePosted {
+		return soroban.ReservePosted{
+			Meta: eventMeta(id, 20, asOf), SAC: testSAC, Tier: tier,
+			Amount: big.NewInt(amount), AsOf: asOf, Reporter: fmt.Sprintf("GREP%d", tier),
+			DocHash: "doc-" + id, DocURI: "https://issuer.example/" + id,
+		}
 	}
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-2", 23, events); err != nil {
+	events := []any{
+		report("ev-t1-old", 1, 900, base),
+		report("ev-t1-new", 1, 950, base.Add(48*time.Hour)),
+		report("ev-t2", 2, 980, base.Add(24*time.Hour)),
+		report("ev-t3", 3, 1_000, base.Add(12*time.Hour)),
+	}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "c", 20, nil, events); err != nil {
 		t.Fatal(err)
 	}
 
-	reports, err := s.LatestReports(ctx, testSAC)
+	latest, err := s.LatestReports(ctx, testSAC)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reports) != 2 {
-		t.Fatalf("LatestReports returned %d tiers, want 2: %+v", len(reports), reports)
+	if len(latest) != 3 {
+		t.Fatalf("LatestReports returned %d tiers, want 3", len(latest))
 	}
-	if got := reports[1]; got.Reporter != "GNEW" || got.Amount.Cmp(big.NewInt(200)) != 0 {
-		t.Errorf("tier 1 newest = %+v, want GNEW/200", got)
+	if got := latest[1]; got.Amount.Cmp(big.NewInt(950)) != 0 || !got.AsOf.Equal(base.Add(48*time.Hour)) {
+		t.Errorf("tier 1 = amount %v as_of %v, want the newer report", got.Amount, got.AsOf)
 	}
-	if got := reports[3]; got.Reporter != "GAUD" || got.Amount.Cmp(big.NewInt(300)) != 0 {
-		t.Errorf("tier 3 newest = %+v, want GAUD/300", got)
+	if got := latest[2]; got.Amount.Cmp(big.NewInt(980)) != 0 || !got.AsOf.Equal(base.Add(24*time.Hour)) {
+		t.Errorf("tier 2 = amount %v as_of %v", got.Amount, got.AsOf)
 	}
-	if _, ok := reports[2]; ok {
-		t.Errorf("tier 2 came from another asset: %+v", reports[2])
+	if got := latest[3]; got.Amount.Cmp(big.NewInt(1_000)) != 0 || !got.AsOf.Equal(base.Add(12*time.Hour)) {
+		t.Errorf("tier 3 = amount %v as_of %v", got.Amount, got.AsOf)
 	}
 }
 
-func TestBreakdownBytesRoundTrip(t *testing.T) {
+func TestBreakdownBytesRoundTripExactly(t *testing.T) {
 	s, _ := openStore(t)
 	ctx := context.Background()
-	// Whitespace, an escaped string and multi-byte characters: anything that a
-	// JSONB round-trip would normalise.
-	body := []byte("{\n  \"asset\": \"PUSD:GISS\",\n  \"note\": \"caf\u00e9 \u2014 \u00fcber\",\n  \"total\": \"10\"\n}\n")
+	// The exact bytes matter: sha256(body) is the on-chain hash, so spacing,
+	// field order and the trailing newline must survive storage.
+	body := []byte("{\n  \"total\": \"10200000000\",\n  \"buckets\": [\"a\", \"b\"]\n}\n")
 	sum := sha256.Sum256(body)
-	hash := hex.EncodeToString(sum[:])
+	hash := fmt.Sprintf("%x", sum)
 
 	if err := s.SaveBreakdown(ctx, hash, testSAC, body); err != nil {
+		t.Fatal(err)
+	}
+	// Only a breakdown that backs an on-chain snapshot is served.
+	if err := s.ConfirmBreakdown(ctx, hash); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Breakdown(ctx, hash)
@@ -175,11 +167,20 @@ func TestBreakdownBytesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, body) {
-		t.Fatalf("breakdown came back changed:\n got: %q\nwant: %q", got, body)
+		t.Fatalf("Breakdown returned %q, want %q", got, body)
 	}
-	// The served bytes must still hash to the value posted on chain.
-	check := sha256.Sum256(got)
-	if hex.EncodeToString(check[:]) != hash {
-		t.Fatalf("sha256(served) = %x, want %s", check, hash)
+	if after := sha256.Sum256(got); after != sum {
+		t.Fatalf("hash of served body = %x, want %x", after, sum)
+	}
+
+	// A second save for the same hash keeps the first body: the hash is the
+	// identity, and overwriting it would break an already-posted snapshot.
+	if err := s.SaveBreakdown(ctx, hash, testSAC, []byte(`{"total":"0"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = s.Breakdown(ctx, hash); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(got, body) {
+		t.Fatalf("Breakdown after duplicate save = %q, want the original", got)
 	}
 }

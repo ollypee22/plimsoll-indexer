@@ -5,11 +5,12 @@ package stellartoml
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -17,6 +18,8 @@ import (
 
 // maxTomlBytes matches the SEP-1 limit of 100KB.
 const maxTomlBytes = 100 * 1024
+
+const maxRedirects = 5
 
 // Currency is the subset of a [[CURRENCIES]] entry Plimsoll shows.
 type Currency struct {
@@ -54,7 +57,15 @@ type Fetcher struct {
 
 func NewFetcher() *Fetcher {
 	return &Fetcher{
-		HTTP: &http.Client{Timeout: 10 * time.Second},
+		HTTP: &http.Client{
+			Timeout: 10 * time.Second,
+			CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+				if len(via) > maxRedirects {
+					return fmt.Errorf("stopped after %d redirects", maxRedirects)
+				}
+				return nil
+			},
+		},
 		URLFor: func(domain string) string {
 			return "https://" + domain + "/.well-known/stellar.toml"
 		},
@@ -64,30 +75,39 @@ func NewFetcher() *Fetcher {
 // Fetch downloads and parses the stellar.toml for domain, and returns the
 // entry matching code and issuer (Currency is nil if there is none).
 func (f *Fetcher) Fetch(ctx context.Context, domain, code, issuer string) (Info, error) {
+	info, _, err := f.FetchSnapshot(ctx, domain, code, issuer)
+	return info, err
+}
+
+// FetchSnapshot fetches and parses a stellar.toml, returning its SHA-256 over
+// the exact response bytes. The hash is returned even if TOML parsing fails.
+func (f *Fetcher) FetchSnapshot(ctx context.Context, domain, code, issuer string) (Info, string, error) {
 	info := Info{HomeDomain: domain}
 	if domain == "" {
-		return info, errors.New("issuer has no home_domain")
+		return info, "", errors.New("issuer has no home_domain")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.URLFor(domain), nil)
 	if err != nil {
-		return info, err
+		return info, "", err
 	}
 	resp, err := f.HTTP.Do(req)
 	if err != nil {
-		return info, fmt.Errorf("fetch stellar.toml: %w", err)
+		return info, "", fmt.Errorf("fetch stellar.toml: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return info, fmt.Errorf("fetch stellar.toml: status %d", resp.StatusCode)
+		return info, "", fmt.Errorf("fetch stellar.toml: status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTomlBytes+1))
 	if err != nil {
-		return info, fmt.Errorf("read stellar.toml: %w", err)
+		return info, "", fmt.Errorf("read stellar.toml: %w", err)
 	}
 	if len(body) > maxTomlBytes {
-		return info, errors.New("stellar.toml exceeds 100KB")
+		return info, "", errors.New("stellar.toml exceeds 100KB")
 	}
-	return Parse(domain, body, code, issuer)
+	hash := sha256.Sum256(body)
+	info, err = Parse(domain, body, code, issuer)
+	return info, hex.EncodeToString(hash[:]), err
 }
 
 // Parse extracts Info from a stellar.toml body.
@@ -101,7 +121,11 @@ func Parse(domain string, body []byte, code, issuer string) (Info, error) {
 	info.OrgURL = doc.Documentation.OrgURL
 	for i := range doc.Currencies {
 		c := doc.Currencies[i]
-		if strings.EqualFold(c.Code, code) && c.Issuer == issuer {
+		// Asset codes are case-sensitive: usdc and USDC from one issuer are
+		// different assets, so a case-insensitive match here could attach one
+		// asset's attestation_of_reserve to another. This also has to agree
+		// with the SDK's findCurrency, which compares exactly.
+		if c.Code == code && c.Issuer == issuer {
 			info.Currency = &c
 			break
 		}

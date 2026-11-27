@@ -18,11 +18,13 @@ import (
 	"github.com/stellar/go-stellar-sdk/keypair"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/api"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/changelog"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/config"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/stellartoml"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/webhook"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/worker"
 )
 
@@ -30,8 +32,14 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "verify" {
 		os.Exit(runVerifyCommand(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "replay" {
+		os.Exit(runReplayCommand(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		os.Exit(runHealthcheck())
+	}
+	if len(os.Args) > 1 && os.Args[1] == "keygen" {
+		os.Exit(runKeygenCommand(os.Args[2:]))
 	}
 
 	cfg, err := config.Load()
@@ -56,15 +64,33 @@ func run(cfg config.Config, log *slog.Logger) error {
 	}
 	defer db.Close()
 
-	rpc := rpcclient.NewClient(cfg.RPCURL, &http.Client{Timeout: 30 * time.Second})
+	// Every RPC call goes through the rate-limit transport, so a node that
+	// answers 429 backs the caller off, honouring Retry-After, instead of
+	// failing the tick and retrying on the next one.
+	rpcHTTP := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: soroban.NewRateLimitTransport(nil, log.With("component", "rpc")),
+	}
+	rpc := rpcclient.NewClient(cfg.RPCURL, rpcHTTP)
 	defer rpc.Close()
 	hz := horizon.NewClient(cfg.HorizonURL)
+
+	var webhookCodec *webhook.SecretCodec
+	var webhookDispatcher *webhook.Dispatcher
+	if cfg.WebhookEncryptionKey != "" {
+		webhookCodec, err = webhook.NewSecretCodec(cfg.WebhookEncryptionKey)
+		if err != nil {
+			return err
+		}
+		webhookDispatcher = webhook.NewDispatcher(db, webhookCodec)
+	}
 
 	ingester := &worker.Ingester{
 		RPC:         rpc,
 		Store:       db,
 		ContractIDs: []string{cfg.CoverageLedgerID, cfg.ReporterRegistryID},
 		StartLedger: cfg.StartLedger,
+		Workers:     cfg.IngestWorkers,
 		Log:         log.With("job", "ingest"),
 	}
 	// Ingest once before the other jobs start, so they see the listed assets.
@@ -91,6 +117,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		Horizon:     hz,
 		Fetcher:     stellartoml.NewFetcher(),
 		Store:       db,
+		Webhooks:    webhookDispatcher,
 		Attestation: stellartoml.NewDocumentFetcher(),
 		MaxAge:      cfg.TomlInterval,
 		Log:         log.With("job", "toml"),
@@ -105,7 +132,6 @@ func run(cfg config.Config, log *slog.Logger) error {
 			Log:    log.With("job", "webhooks"),
 			Now:    time.Now,
 		}
-		log.Info("coverage alerts enabled", "interval", cfg.WebhookInterval)
 		go every(ctx, cfg.WebhookInterval, log.With("job", "webhooks"), notifier.Run)
 	}
 
@@ -159,10 +185,21 @@ func run(cfg config.Config, log *slog.Logger) error {
 		log.Info("supply posting disabled (SUPPLY_POSTER_SECRET not set)")
 	}
 
+	// A malformed changelog would break the published API contract, so refuse
+	// to start rather than serve it.
+	changes, err := changelog.Load()
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr: ":" + cfg.Port,
 		Handler: (&api.Server{
-			Store: db,
+			Store:             db,
+			WebhookStore:      db,
+			WebhookAdminToken: cfg.WebhookAdminToken,
+			WebhookAPIKeys:    cfg.WebhookAPIKeys,
+			WebhookCodec:      webhookCodec,
 			Network: api.NetworkInfo{
 				NetworkPassphrase:  cfg.NetworkPassphrase,
 				RPCURL:             cfg.RPCURL,
@@ -170,13 +207,18 @@ func run(cfg config.Config, log *slog.Logger) error {
 				CoverageLedgerID:   cfg.CoverageLedgerID,
 				ReporterRegistryID: cfg.ReporterRegistryID,
 			},
-			Webhooks:   db,
-			AdminToken: cfg.WebhookAdminToken,
-			CORS:       cfg.CORSOrigins,
-			Log:        log.With("component", "api"),
-			Now:        time.Now,
+			CoverageWebhooks:     db,
+			WebhookSigningSecret: cfg.WebhookSigningSecret,
+			CORS:                 cfg.CORSOrigins,
+			Log:                  log.With("component", "api"),
+			Now:                  time.Now,
+			Changelog:            changes,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second, // Bounds the time clients can spend sending request bodies.
+		WriteTimeout:      30 * time.Second, // Closes connections when clients stall while receiving responses.
+		IdleTimeout:       60 * time.Second, // Reclaims keep-alive connections that are left idle.
+		MaxHeaderBytes:    1 << 20,          // Caps request headers at 1 MiB to limit per-connection memory use.
 	}
 	go func() {
 		<-ctx.Done()
