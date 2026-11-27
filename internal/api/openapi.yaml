@@ -262,8 +262,146 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/webhooks:
+    post:
+      summary: Register a coverage threshold alert
+      description: Requires the admin bearer token. When coverage falls below min_bps, the indexer POSTs a signed JSON alert to url. One alert is sent per crossing; the registration re-arms when coverage recovers.
+      operationId: createWebhook
+      security:
+        - adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookRegistration'
+      responses:
+        '201':
+          description: Registration created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '400':
+          description: Invalid URL, SAC or threshold
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid admin token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Webhook administration is not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/webhooks/{id}:
+    delete:
+      summary: Remove a coverage threshold alert
+      description: Requires the admin bearer token. The delivery log is removed with the registration.
+      operationId: deleteWebhook
+      security:
+        - adminToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Registration id
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      responses:
+        '204':
+          description: Registration removed
+        '400':
+          description: Invalid id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid admin token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Registration not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Webhook administration is not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 components:
+  securitySchemes:
+    adminToken:
+      type: http
+      scheme: bearer
   schemas:
+    WebhookRegistration:
+      type: object
+      required:
+        - url
+        - sac
+        - min_bps
+        - min_tier
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Absolute http(s) URL that receives the signed POST.
+          example: "https://integrator.example/plimsoll"
+        sac:
+          type: string
+          description: Stellar Asset Contract address to watch.
+          example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+        min_bps:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          description: Alert when coverage falls below this many basis points.
+          example: 9500
+        min_tier:
+          type: integer
+          enum: [1, 2, 3]
+          description: Minimum report tier used to compute coverage.
+          example: 2
+    Webhook:
+      type: object
+      required:
+        - id
+        - url
+        - sac
+        - min_bps
+        - min_tier
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+        url:
+          type: string
+          format: uri
+        sac:
+          type: string
+        min_bps:
+          type: integer
+        min_tier:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
     NetworkInfo:
       type: object
       properties:
@@ -429,6 +567,11 @@ components:
           example: "2026-10-01T00:00:00Z"
         toml:
           type: [object, "null"]
+          description: >-
+            The stored stellar.toml data. When the issuer lists an
+            attestation_of_reserve document, this object carries
+            attestation_hash, attestation_first_seen_at and, once the
+            document has changed, attestation_changed_at.
         toml_checked_at:
           type: [string, "null"]
           format: date-time

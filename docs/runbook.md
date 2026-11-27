@@ -14,6 +14,7 @@ One process (`cmd/plimsoll-indexer`) runs these jobs and an HTTP server on
 | Event ingester | `ingest` | `INGEST_INTERVAL` (10s) | no |
 | State reconciler | `reconcile` | `RECONCILE_INTERVAL` (15m) | no |
 | stellar.toml sync | `toml` | checked every minute, each asset refreshed every `TOML_INTERVAL` (6h) | no |
+| Coverage alerts | `webhooks` | `WEBHOOK_INTERVAL` (1m) | no |
 | Supply poster | `poster` | `POST_INTERVAL` (15m), reposts after `REPOST_AFTER` (6h) | yes, `SUPPLY_POSTER_SECRET` |
 | Keep-awake | `keepawake` | `KEEP_AWAKE_INTERVAL` (10m) | no |
 
@@ -37,6 +38,9 @@ values are reported together at startup.
 | `HORIZON_CHECK_URL` | empty | Second, independently operated Horizon. Empty disables the cross-check. |
 | `START_LEDGER` | `0` | First ledger to ingest. `0` or a ledger in the future means "latest"; older than RPC retention is clamped. |
 | `SUPPLY_POSTER_SECRET` | empty | Empty runs read-only. Never log or share it. |
+| `WEBHOOK_ADMIN_TOKEN` | empty | Bearer token for `POST`/`DELETE /v1/webhooks`. Set with the signing secret. |
+| `WEBHOOK_SIGNING_SECRET` | empty | HMAC-SHA256 key for coverage alert deliveries. Set with the admin token. |
+| `WEBHOOK_INTERVAL` | `1m` | How often coverage thresholds and due deliveries are evaluated. |
 | `PORT` | `8080` | |
 | `CORS_ORIGINS` | `*` | Comma separated. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. Logs are JSON on stdout. |
@@ -111,6 +115,8 @@ Logs are JSON (`log/slog`). Key messages:
 | warn | `ingest cursor is older than RPC retention...` | Ingestion was down longer than RPC's ~7 days. Events in the gap are gone from RPC; the reconciler repairs the latest state. |
 | warn | `start ledger is outside RPC retention` | `START_LEDGER` is too old and was clamped. |
 | warn | `recovered a supply snapshot / reserve report from contract state...` | The reconciler filled a gap. Rows are marked `"source": "chain"` with no `tx_hash`. |
+| info | `coverage below webhook threshold` (`webhook_id`, `sac`, `bps`, `min_bps`) | A registered alert fired. |
+| warn | `webhook delivery failed` (`webhook_id`, `delivery_id`, `status`, `retry_at`) | Delivery will be retried with backoff, at most five attempts in total. |
 | info | `supply posting disabled (SUPPLY_POSTER_SECRET not set)` | Expected on read-only instances. |
 | info | `supply cross-check disabled (HORIZON_CHECK_URL not set)` | The poster signs on one Horizon's word. |
 
