@@ -158,7 +158,6 @@ func TestBreakdownBytesRoundTripExactly(t *testing.T) {
 	if err := s.SaveBreakdown(ctx, hash, testSAC, body); err != nil {
 		t.Fatal(err)
 	}
-	// Only a breakdown that backs an on-chain snapshot is served.
 	if err := s.ConfirmBreakdown(ctx, hash); err != nil {
 		t.Fatal(err)
 	}

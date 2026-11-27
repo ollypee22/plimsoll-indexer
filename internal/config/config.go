@@ -64,8 +64,6 @@ type Config struct {
 	WebhookEncryptionKey string
 	SlackWebhookURL      string
 	DiscordWebhookURL    string
-	// WebhookSigningSecret keys the HMAC-SHA256 signature on coverage alert
-	// deliveries; it needs WebhookAdminToken.
 	WebhookSigningSecret string
 	WebhookInterval      time.Duration
 	IngestInterval       time.Duration

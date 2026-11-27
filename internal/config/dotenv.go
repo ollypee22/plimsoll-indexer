@@ -34,8 +34,7 @@ func loadEnvLocal() error {
 // environment. A missing file is not an error. The whole file is parsed before
 // any variable is set, so a malformed line changes nothing.
 func loadEnvFile(path string) error {
-	// #nosec G304 -- path is the project's fixed .env.local overlay (or a test
-	// temporary file), never a value supplied by a request.
+	// #nosec G304 -- production only calls this with the fixed .env.local path.
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
