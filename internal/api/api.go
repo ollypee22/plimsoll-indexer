@@ -3,13 +3,17 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
@@ -30,7 +34,15 @@ type Reader interface {
 	ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error)
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
+	Attestation(ctx context.Context, sac string) (store.Attestation, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
+}
+
+// WebhookManager is what the API needs to manage coverage threshold
+// registrations.
+type WebhookManager interface {
+	CreateWebhook(ctx context.Context, w coverage.Webhook) (coverage.Webhook, error)
+	DeleteWebhook(ctx context.Context, id int64) error
 }
 
 // NetworkInfo is served at /v1/network so clients can discover contract ids.
@@ -48,6 +60,11 @@ type Server struct {
 	CORS    []string
 	Log     *slog.Logger
 	Now     func() time.Time
+
+	// Webhooks and AdminToken enable coverage alert registration at
+	// /v1/webhooks. Both must be set; otherwise those endpoints answer 503.
+	Webhooks   WebhookManager
+	AdminToken string
 }
 
 func (s *Server) Handler() http.Handler {
@@ -61,6 +78,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
+	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
+	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
 	return s.cors(mux)
 }
 
@@ -235,20 +254,61 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 	if err != nil {
 		return assetJSON{}, err
 	}
+	att, attErr := s.Store.Attestation(ctx, a.SAC)
+	if attErr != nil && !errors.Is(attErr, store.ErrNotFound) {
+		return assetJSON{}, attErr
+	}
+	tomlBody, err := withAttestation(a.Toml, att, attErr == nil)
+	if err != nil {
+		return assetJSON{}, err
+	}
 	out := assetJSON{
 		Asset:    a,
-		Toml:     json.RawMessage("null"),
+		Toml:     tomlBody,
 		Supply:   toSupply(sp),
 		Reports:  map[string]*reportJSON{},
 		Coverage: s.toCoverage(coverage.Compute(sp, reports, minTier)),
-	}
-	if len(a.Toml) > 0 {
-		out.Toml = a.Toml
 	}
 	for tier, rep := range reports {
 		out.Reports[coverage.TierName(tier)] = toReport(rep)
 	}
 	return out, nil
+}
+
+// withAttestation adds the issuer's attestation document fields to the stored
+// SEP-1 object. The object is re-encoded, so its key order is that of
+// encoding/json; nothing else about it changes.
+func withAttestation(raw []byte, att store.Attestation, found bool) (json.RawMessage, error) {
+	if !found && len(raw) == 0 {
+		return json.RawMessage("null"), nil
+	}
+	obj := map[string]json.RawMessage{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil, fmt.Errorf("decode stored stellar.toml: %w", err)
+		}
+	}
+	if found {
+		obj["attestation_hash"] = mustJSON(att.Hash)
+		obj["attestation_first_seen_at"] = mustJSON(att.FirstSeenAt.UTC().Format(time.RFC3339))
+		if att.ChangedAt != nil {
+			obj["attestation_changed_at"] = mustJSON(att.ChangedAt.UTC().Format(time.RFC3339))
+		}
+	}
+	body, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("encode asset toml: %w", err)
+	}
+	return body, nil
+}
+
+func mustJSON(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		// Every value passed here is a string, which cannot fail to encode.
+		panic(err)
+	}
+	return b
 }
 
 func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
@@ -314,6 +374,100 @@ func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+// ---- coverage webhooks ----------------------------------------------------
+
+// webhookRequest is the body of POST /v1/webhooks.
+type webhookRequest struct {
+	URL     string `json:"url"`
+	SAC     string `json:"sac"`
+	MinBps  uint32 `json:"min_bps"`
+	MinTier uint32 `json:"min_tier"`
+}
+
+func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req webhookRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "body must be a JSON object")
+		return
+	}
+	req.URL = strings.TrimSpace(req.URL)
+	if msg := validateWebhook(req); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+	wh, err := s.Webhooks.CreateWebhook(r.Context(), coverage.Webhook{
+		URL: req.URL, SAC: req.SAC, MinBps: req.MinBps, MinTier: req.MinTier,
+	})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, wh)
+}
+
+func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "webhook id must be a positive integer")
+		return
+	}
+	err = s.Webhooks.DeleteWebhook(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "webhook not found")
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// requireAdmin checks the bearer token on webhook administration requests. It
+// writes the response itself and returns false when the request is refused.
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.AdminToken == "" || s.Webhooks == nil {
+		writeError(w, http.StatusServiceUnavailable, "webhook administration is disabled")
+		return false
+	}
+	const prefix = "Bearer "
+	token := ""
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, prefix) {
+		token = strings.TrimSpace(auth[len(prefix):])
+	}
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.AdminToken)) != 1 {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, http.StatusUnauthorized, "invalid admin token")
+		return false
+	}
+	return true
+}
+
+// validateWebhook returns an error message, empty when the request is valid.
+func validateWebhook(req webhookRequest) string {
+	u, err := url.Parse(req.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "url must be an absolute http or https URL"
+	}
+	if req.SAC == "" {
+		return "sac is required"
+	}
+	if req.MinBps < 1 || req.MinBps > 10_000 {
+		return "min_bps must be between 1 and 10000"
+	}
+	if req.MinTier < 1 || req.MinTier > 3 {
+		return "min_tier must be 1, 2 or 3"
+	}
+	return ""
+}
+
 // ---- helpers --------------------------------------------------------------
 
 func parseTier(w http.ResponseWriter, r *http.Request) (uint32, bool) {
@@ -352,7 +506,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 				break
 			}
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

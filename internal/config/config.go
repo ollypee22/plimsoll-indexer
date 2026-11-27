@@ -57,8 +57,15 @@ type Config struct {
 	ReporterRegistryID string
 	StartLedger        uint32
 	PosterSecret       string
-	IngestInterval     time.Duration
-	PostInterval       time.Duration
+	// WebhookAdminToken protects webhook administration; WebhookSigningSecret
+	// keys the HMAC-SHA256 signature on coverage alert deliveries. They are
+	// configured together: a secret without the token could never be used, and
+	// a token without the secret would register alerts nobody can verify.
+	WebhookAdminToken    string
+	WebhookSigningSecret string
+	WebhookInterval      time.Duration
+	IngestInterval       time.Duration
+	PostInterval         time.Duration
 	// ReconcileInterval is how often contract state is read back to repair
 	// what event ingestion missed. Each pass is a handful of simulations per
 	// asset, so it can be infrequent.
@@ -97,18 +104,20 @@ func Load() (Config, error) {
 	}
 
 	c := Config{
-		Network:            network,
-		DatabaseURL:        os.Getenv("DATABASE_URL"),
-		Port:               envOr("PORT", "8080"),
-		RPCURL:             envOr("STELLAR_RPC_URL", preset.RPCURL),
-		HorizonURL:         strings.TrimRight(envOr("HORIZON_URL", preset.HorizonURL), "/"),
-		HorizonCheckURL:    strings.TrimRight(os.Getenv("HORIZON_CHECK_URL"), "/"),
-		NetworkPassphrase:  envOr("STELLAR_NETWORK_PASSPHRASE", preset.Passphrase),
-		CoverageLedgerID:   os.Getenv("COVERAGE_LEDGER_ID"),
-		ReporterRegistryID: os.Getenv("REPORTER_REGISTRY_ID"),
-		PosterSecret:       os.Getenv("SUPPLY_POSTER_SECRET"),
-		LogLevel:           envOr("LOG_LEVEL", "info"),
-		KeepAwakeURL:       keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
+		Network:              network,
+		DatabaseURL:          os.Getenv("DATABASE_URL"),
+		Port:                 envOr("PORT", "8080"),
+		RPCURL:               envOr("STELLAR_RPC_URL", preset.RPCURL),
+		HorizonURL:           strings.TrimRight(envOr("HORIZON_URL", preset.HorizonURL), "/"),
+		HorizonCheckURL:      strings.TrimRight(os.Getenv("HORIZON_CHECK_URL"), "/"),
+		NetworkPassphrase:    envOr("STELLAR_NETWORK_PASSPHRASE", preset.Passphrase),
+		CoverageLedgerID:     os.Getenv("COVERAGE_LEDGER_ID"),
+		ReporterRegistryID:   os.Getenv("REPORTER_REGISTRY_ID"),
+		PosterSecret:         os.Getenv("SUPPLY_POSTER_SECRET"),
+		WebhookAdminToken:    os.Getenv("WEBHOOK_ADMIN_TOKEN"),
+		WebhookSigningSecret: os.Getenv("WEBHOOK_SIGNING_SECRET"),
+		LogLevel:             envOr("LOG_LEVEL", "info"),
+		KeepAwakeURL:         keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
 	}
 
 	if c.RPCURL == "" {
@@ -122,6 +131,9 @@ func Load() (Config, error) {
 	}
 	if c.ReporterRegistryID == "" {
 		errs = append(errs, errors.New("REPORTER_REGISTRY_ID is required"))
+	}
+	if (c.WebhookAdminToken == "") != (c.WebhookSigningSecret == "") {
+		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_SIGNING_SECRET must be configured together"))
 	}
 
 	start, err := strconv.ParseUint(envOr("START_LEDGER", "0"), 10, 32)
@@ -140,6 +152,7 @@ func Load() (Config, error) {
 		{"RECONCILE_INTERVAL", "15m", &c.ReconcileInterval},
 		{"REPOST_AFTER", "6h", &c.RepostAfter},
 		{"TOML_INTERVAL", "6h", &c.TomlInterval},
+		{"WEBHOOK_INTERVAL", "1m", &c.WebhookInterval},
 		{"KEEP_AWAKE_INTERVAL", "10m", &c.KeepAwakeInterval},
 	}
 	for _, d := range durations {

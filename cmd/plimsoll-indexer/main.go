@@ -88,14 +88,26 @@ func run(cfg config.Config, log *slog.Logger) error {
 	go every(ctx, cfg.ReconcileInterval, log.With("job", "reconcile"), reconciler.Run)
 
 	tomlSync := &worker.TomlSync{
-		Horizon: hz,
-		Fetcher: stellartoml.NewFetcher(),
-		Store:   db,
-		MaxAge:  cfg.TomlInterval,
-		Log:     log.With("job", "toml"),
+		Horizon:     hz,
+		Fetcher:     stellartoml.NewFetcher(),
+		Store:       db,
+		Attestation: stellartoml.NewDocumentFetcher(),
+		MaxAge:      cfg.TomlInterval,
+		Log:         log.With("job", "toml"),
 	}
 	// Checks every minute; each asset is refreshed once per TOML_INTERVAL.
 	go every(ctx, time.Minute, log.With("job", "toml"), tomlSync.Run)
+
+	if cfg.WebhookSigningSecret != "" {
+		notifier := &worker.WebhookNotifier{
+			Store:  db,
+			Secret: cfg.WebhookSigningSecret,
+			Log:    log.With("job", "webhooks"),
+			Now:    time.Now,
+		}
+		log.Info("coverage alerts enabled", "interval", cfg.WebhookInterval)
+		go every(ctx, cfg.WebhookInterval, log.With("job", "webhooks"), notifier.Run)
+	}
 
 	if cfg.KeepAwakeURL != "" {
 		keepAwake := worker.NewKeepAwake(cfg.KeepAwakeURL)
@@ -158,9 +170,11 @@ func run(cfg config.Config, log *slog.Logger) error {
 				CoverageLedgerID:   cfg.CoverageLedgerID,
 				ReporterRegistryID: cfg.ReporterRegistryID,
 			},
-			CORS: cfg.CORSOrigins,
-			Log:  log.With("component", "api"),
-			Now:  time.Now,
+			Webhooks:   db,
+			AdminToken: cfg.WebhookAdminToken,
+			CORS:       cfg.CORSOrigins,
+			Log:        log.With("component", "api"),
+			Now:        time.Now,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

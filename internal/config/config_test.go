@@ -128,6 +128,9 @@ func TestLoadDefaults(t *testing.T) {
 	if got.TomlInterval.String() != "6h0m0s" {
 		t.Errorf("TomlInterval = %v, want 6h0m0s", got.TomlInterval)
 	}
+	if got.WebhookInterval.String() != "1m0s" {
+		t.Errorf("WebhookInterval = %v, want 1m0s", got.WebhookInterval)
+	}
 	if got.KeepAwakeInterval.String() != "10m0s" {
 		t.Errorf("KeepAwakeInterval = %v, want 10m0s", got.KeepAwakeInterval)
 	}
@@ -186,6 +189,7 @@ func TestLoadBadDurations(t *testing.T) {
 		"RECONCILE_INTERVAL",
 		"REPOST_AFTER",
 		"TOML_INTERVAL",
+		"WEBHOOK_INTERVAL",
 		"KEEP_AWAKE_INTERVAL",
 	}
 	for _, v := range durationVars {
@@ -198,6 +202,40 @@ func TestLoadBadDurations(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), v) {
 				t.Errorf("error = %q, want it to mention %q", err.Error(), v)
+			}
+		})
+	}
+}
+
+// TestWebhookConfigPairing checks that the admin token and signing secret are
+// configured together: either alone is refused.
+func TestWebhookConfigPairing(t *testing.T) {
+	cases := []struct {
+		token, secret string
+		wantErr       bool
+	}{
+		{"", "", false},
+		{"admin", "secret", false},
+		{"admin", "", true},
+		{"", "secret", true},
+	}
+	for _, c := range cases {
+		t.Run(c.token+"/"+c.secret, func(t *testing.T) {
+			setBase(t)
+			t.Setenv("WEBHOOK_ADMIN_TOKEN", c.token)
+			t.Setenv("WEBHOOK_SIGNING_SECRET", c.secret)
+			got, err := Load()
+			if c.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "WEBHOOK_ADMIN_TOKEN and WEBHOOK_SIGNING_SECRET") {
+					t.Fatalf("err = %v, want the pairing error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.WebhookAdminToken != c.token || got.WebhookSigningSecret != c.secret {
+				t.Errorf("config = %q/%q, want %q/%q", got.WebhookAdminToken, got.WebhookSigningSecret, c.token, c.secret)
 			}
 		})
 	}
